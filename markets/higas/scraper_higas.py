@@ -13,8 +13,10 @@ Barcode  : the v5 API no longer exposes `barcodes` (apiv3 did). Filled from the 
            table (~65-80% of the catalogue) and tools/crossfill_barcodes.py.
 
 RATE LIMIT (learned 2026-09-06): api.ibecom.com.br sits behind Cloudflare AND has its
-own limiter. Around 8 requests in quick succession answer 400/429, then 403
-{"error_message":"Acesso bloqueado"} for a long time (hours) for the whole IP. So:
+own limiter. Some pages answer HTTP 400 deterministically (a broken item the API cannot
+serialise - page 8 on two different IPs); retrying such a page earns 429 and then
+403 {"error_message":"Acesso bloqueado"} for hours for the whole IP. So:
+  * a 400 page is skipped at once (never retried); 429/5xx wait 60 s, 120 s, ...
   * one request every HIGAS_DELAY seconds (default 2.5 s -> ~18 min for 425 pages)
   * browser headers + the site's `ibsessionid`, curl_cffi Chrome impersonation when installed
   * on "Acesso bloqueado" we stop immediately (retrying only extends the ban)
@@ -130,6 +132,7 @@ def scrape(db, zip_code: str, limit: Optional[int] = None) -> Dict[str, int]:
     total = {"upserted": 0, "skipped": 0, "with_barcode": 0}
     page, total_pages = 1, 1
     soft_errors = 0
+    skipped_pages = 0
     while page <= total_pages and page <= 2000:
         try:
             r = client.get(f"{API_V5}/items", {"limit": PAGE_LIMIT, "page": page})
@@ -144,11 +147,20 @@ def scrape(db, zip_code: str, limit: Optional[int] = None) -> Dict[str, int]:
         if r.status_code == 403 and "bloqueado" in text.lower():
             raise RuntimeError("Higas: API answered 'Acesso bloqueado' (IP banned for a while). "
                                "Increase HIGAS_DELAY or run later / from another IP.")
+        if r.status_code == 400 and not looks_like_challenge(text):
+            # A page whose payload the API cannot serialise (one broken item) answers 400
+            # deterministically (seen on page 8 from two different IPs). Retrying it only
+            # earns a 429 and then the ban: skip the page and move on.
+            skipped_pages += 1
+            print(f"[higas] page {page}: HTTP 400 from the API - page skipped ({skipped_pages} so far)")
+            page += 1
+            time.sleep(DELAY)
+            continue
         if r.status_code != 200 or looks_like_challenge(text):
             soft_errors += 1
             if soft_errors > 5:
                 raise RuntimeError(f"Higas: too many HTTP {r.status_code} answers - stopping to avoid a ban")
-            wait = 30 * soft_errors
+            wait = 60 * soft_errors
             print(f"[higas] page {page}: HTTP {r.status_code} - waiting {wait}s")
             time.sleep(wait)
             continue
